@@ -4,37 +4,38 @@ set -euo pipefail
 LOG=/var/log/install-docker-portainer.log
 exec > >(tee -a "$LOG") 2>&1
 
-echo "=== $(date '+%F %T') START install-docker-portainer ==="
+echo "=== $(date '+%F %T') START: optimize + install docker & portainer ==="
 
-# Yêu cầu chạy bằng root
+# must be run as root
 if [ "$(id -u)" -ne 0 ]; then
-  echo "ERROR: Run as root (use sudo)." >&2
-  exit 1
+  echo "ERROR: run as root (use sudo)"; exit 1
 fi
 
-# Hệ điều hành kiểm tra (yêu cầu apt)
-if ! command -v apt >/dev/null 2>&1; then
-  echo "ERROR: This script requires apt (Debian/Ubuntu)." >&2
-  exit 1
-fi
-
-echo "-- apt update"
+# --- Basic system update & utilities
+echo "-- update apt and install essentials"
 apt update -y
+DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+  ca-certificates curl gnupg lsb-release apt-transport-https unzip sudo net-tools iproute2
 
-echo "-- install common packages"
-apt install -y ca-certificates curl gnupg lsb-release apt-transport-https || true
+# --- timezone locale small sanity (optional: keep minimal)
+# ensure tzdata doesn't prompt
+export DEBIAN_FRONTEND=noninteractive
 
-# Install qemu-guest-agent (so Proxmox guest exec hoạt động)
+# --- Install/enable qemu-guest-agent (for Proxmox host <-> guest integration)
 if ! dpkg -l | grep -qw qemu-guest-agent; then
   echo "-- installing qemu-guest-agent"
-  apt install -y qemu-guest-agent
-  systemctl enable --now qemu-guest-agent || true
-else
-  echo "-- qemu-guest-agent already installed"
-  systemctl enable --now qemu-guest-agent || true
+  apt install -y qemu-guest-agent || true
 fi
+systemctl enable --now qemu-guest-agent || true
 
-# Setup Docker repo (idempotent)
+# --- Disable unused services that commonly waste resources (safe defaults)
+for svc in bluetooth avahi-daemon ModemManager; do
+  if systemctl list-unit-files | grep -q "^${svc}"; then
+    systemctl disable --now "${svc}" >/dev/null 2>&1 || true
+  fi
+done
+
+# --- Add docker apt repository (idempotent)
 DOCKER_KEYRING=/etc/apt/keyrings/docker.gpg
 if [ ! -f "$DOCKER_KEYRING" ]; then
   echo "-- add docker gpg key"
@@ -46,50 +47,41 @@ fi
 DOCKER_LIST=/etc/apt/sources.list.d/docker.list
 ARCH=$(dpkg --print-architecture)
 CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-
 if [ ! -f "$DOCKER_LIST" ] || ! grep -q "download.docker.com" "$DOCKER_LIST" 2>/dev/null; then
-  echo "-- add docker apt repository"
-  cat > "$DOCKER_LIST" <<EOF
-deb [arch=${ARCH} signed-by=${DOCKER_KEYRING}] https://download.docker.com/linux/debian ${CODENAME} stable
-EOF
+  echo "deb [arch=${ARCH} signed-by=${DOCKER_KEYRING}] https://download.docker.com/linux/debian ${CODENAME} stable" > "$DOCKER_LIST"
 fi
 
 apt update -y
 
-# Install docker packages if missing
+# --- Install Docker engine (or fallback to docker.io)
 if ! command -v docker >/dev/null 2>&1; then
-  echo "-- install docker packages"
-  apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || apt install -y docker.io
+  echo "-- installing docker packages"
+  apt install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || apt install -y docker.io
 else
-  echo "-- docker present: $(docker --version || true)"
+  echo "-- docker already installed: $(docker --version || true)"
 fi
 
-echo "-- enable and start docker"
+# --- Ensure docker + containerd enabled
 systemctl enable --now docker || true
+systemctl enable --now containerd || true
 
-# Prepare Portainer data dir
+# --- Prepare Portainer data dir and Docker run (idempotent)
 PORTAINER_DATA=/portainer_data
 mkdir -p "$PORTAINER_DATA"
 chown root:root "$PORTAINER_DATA"
 chmod 755 "$PORTAINER_DATA"
 
-# Ensure Portainer container running (idempotent)
+# remove old non-running portainer container if exists
 if docker ps -a --format '{{.Names}}' | grep -q '^portainer$'; then
   STATUS=$(docker inspect -f '{{.State.Status}}' portainer 2>/dev/null || echo "unknown")
-  echo "-- existing portainer status: $STATUS"
   if [ "$STATUS" != "running" ]; then
-    echo "-- restarting portainer container"
     docker rm -f portainer 2>/dev/null || true
-  else
-    echo "-- portainer is already running"
   fi
 fi
 
+# run portainer if not running
 if ! docker ps --format '{{.Names}}' | grep -q '^portainer$'; then
-  echo "-- pulling portainer image"
   docker pull portainer/portainer-ce:latest || true
-
-  echo "-- running portainer container"
   docker run -d \
     -p 8000:8000 \
     -p 9443:9443 \
@@ -98,9 +90,11 @@ if ! docker ps --format '{{.Names}}' | grep -q '^portainer$'; then
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v "${PORTAINER_DATA}":/data \
     portainer/portainer-ce:latest || true
+else
+  echo "-- portainer already running"
 fi
 
-# Optional: add a non-root invoking user to docker group if run via sudo
+# --- Optional: add SUDO_USER to docker group when script invoked with sudo
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   if id -nG "$SUDO_USER" | grep -qw docker; then
     echo "-- user $SUDO_USER already in docker group"
@@ -110,4 +104,19 @@ if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
   fi
 fi
 
-echo "=== $(date '+%F %T') DONE install-docker-portainer ==="
+# --- Minimal firewall via ufw (optional: leave disabled if you manage ports via host)
+if ! command -v ufw >/dev/null 2>&1; then
+  apt install -y ufw || true
+fi
+# allow ssh + portainer https and portainer edge
+ufw allow OpenSSH >/dev/null 2>&1 || true
+ufw allow 9443/tcp >/dev/null 2>&1 || true
+ufw allow 8000/tcp >/dev/null 2>&1 || true
+ufw --force enable >/dev/null 2>&1 || true
+
+# --- Housekeeping: clean apt cache, rotate journal small
+apt clean || true
+journalctl --vacuum-size=50M || true
+
+echo "=== $(date '+%F %T') DONE: optimize + install docker & portainer ==="
+exit 0
